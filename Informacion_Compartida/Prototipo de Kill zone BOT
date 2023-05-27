@@ -1,0 +1,135 @@
+import pandas as pd
+import MetaTrader5 as mt5
+import datetime
+import pytz
+import numpy as np
+from scipy import stats
+from sklearn.linear_model import LinearRegression
+from datetime import timedelta
+import time
+
+
+nombre = 22323726
+clave = 'hzjx1dwn'
+servidor = 'Deriv-Demo'
+path = r'C:\Program Files\MetaTrader 5\terminal64.exe'
+
+mt5.initialize(login=nombre, password=clave, server=servidor, path=path)
+
+
+def extraer_datos(simbolo, num_periodos, timeframe):
+    rates = mt5.copy_rates_from_pos(simbolo, timeframe, 0, num_periodos)
+    tabla = pd.DataFrame(rates)
+    tabla['time'] = pd.to_datetime(tabla['time'], unit='s')
+
+    return tabla
+
+
+def is_kill_zone():
+    ny_timezone = pytz.timezone('America/New_York')
+    current_time = datetime.datetime.now(ny_timezone)
+    current_hour = current_time.hour
+    return 2 <= current_hour <= 5
+
+
+def calculate_position_size(symbol, tradeinfo, per_to_risk):
+    mt5.symbol_select(symbol, True)
+    symbol_info_tick = mt5.symbol_info_tick(symbol)
+    symbol_info = mt5.symbol_info(symbol)
+    current_price = (symbol_info_tick.bid + symbol_info_tick.ask) / 2
+    sl = tradeinfo
+    tick_size = symbol_info.trade_tick_size
+    balance = mt5.account_info().balance
+    risk_per_trade = per_to_risk
+    ticks_at_risk = abs(current_price - sl) / tick_size
+    tick_value = symbol_info.trade_tick_value
+    position_size = round((balance * risk_per_trade) / (ticks_at_risk * tick_value), 2)
+
+    return position_size
+
+
+def enviar_operaciones(simbolo, tipo_operacion, precio_tp, precio_sl, volumen_op):
+    orden = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": simbolo,
+        "volume": volumen_op,
+        "type": tipo_operacion,
+        "magic": 202304,
+        "comment": 'Reg',
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_FOK,
+        "sl": precio_sl,  # Establecer el nivel de stop loss
+        "tp": precio_tp  # Establecer el nivel de take profit
+    }
+    mt5.order_send(orden)
+
+
+symbol = 'US_30'
+
+while True:
+    # Obtener los datos del último periodo
+    datos_1 = extraer_datos(symbol, 10, mt5.TIMEFRAME_H1)
+    datos_2 = extraer_datos(symbol, 300, mt5.TIMEFRAME_M5)
+
+    # Algoritmo de regresión lineal y nivel de significancia
+    y = datos_1[['close']]
+    datos_1['minutos'] = range(10)
+    X = datos_1[['minutos']]
+
+    modelo = LinearRegression().fit(X, y)
+
+    pendiente = modelo.coef_
+
+    params = np.append(modelo.intercept_, modelo.coef_)
+    predictions = modelo.predict(X)
+
+    newX = pd.DataFrame({"Constant": np.ones(len(X))}).join(pd.DataFrame(X))
+    MSE = (np.sum((y - predictions) ** 2)) / (len(newX) - len(newX.columns))
+    var_b = MSE[0] * (    np.linalg.inv(np.dot(newX.T, newX)).diagonal())
+    sd_b = np.sqrt(var_b)
+    ts_b = params / sd_b
+
+    p_values = [2 * (1 - stats.t.cdf(np.abs(i), (len(newX) - len(newX.columns)))) for i in ts_b]
+
+    sd_b = np.round(sd_b, 3)
+    ts_b = np.round(ts_b, 3)
+    p_values = np.round(p_values, 3)
+
+    print("p-value:", p_values[1])
+    print("pendiente:", pendiente)
+    tradeinfo = 0.003
+
+    # A partir de aquí se establece el algoritmo de las Kill Zone
+    # Obtener el precio de cierre más reciente
+    current_price = datos_2['close'].iloc[-1]
+
+    # Obtener el rango de la Kill Zone
+    kill_zone_start = datetime.time(2, 0, 0)  # Hora de inicio de la Kill Zone
+    kill_zone_end = datetime.time(5, 0, 0)  # Hora de finalización de la Kill Zone
+    df_kill_zone = extraer_datos(symbol, 300, mt5.TIMEFRAME_M5)  # Obtener suficientes datos para cubrir la Kill Zone
+    kill_zone_prices = df_kill_zone[
+        (df_kill_zone['time'].dt.time >= kill_zone_start) & (df_kill_zone['time'].dt.time <= kill_zone_end)]['close']
+    kill_zone_high = kill_zone_prices.max()
+    kill_zone_low = kill_zone_prices.min()
+    print(f"Valor máximo de la Kill Zone: {kill_zone_high}")
+    print(f"Valor mínimo de la Kill Zone: {kill_zone_low}")
+
+    # Comprobar si el precio actual rompió por encima del máximo de la Kill Zone
+    if (current_price > kill_zone_high) and (pendiente > 0 and p_values[1] < 0.9):
+        # Colocar una orden de compra con el tamaño de posición y los niveles de toma de ganancia y stop loss calculados
+        lotaje = calculate_position_size(symbol, tradeinfo, 0.005)
+        enviar_operaciones(symbol, mt5.ORDER_TYPE_BUY, kill_zone_high + (kill_zone_high - kill_zone_low) / 2,
+                           kill_zone_low - (kill_zone_high - kill_zone_low) / 2, lotaje)
+        print("El precio de cierre está por encima del máximo de la Kill Zone.")
+        print(f"Precio de cierre: {current_price}")
+
+    # Comprobar si el precio actual rompió por debajo del mínimo de la Kill Zone
+    elif (current_price < kill_zone_low) and (pendiente < 0 and p_values[1] < 0.9):
+        # Colocar una orden de venta con el tamaño de posición y los niveles de toma de ganancia y stop loss calculados
+        lotaje = calculate_position_size(symbol, tradeinfo, 0.005)
+        enviar_operaciones(symbol, mt5.ORDER_TYPE_SELL, kill_zone_low - (kill_zone_high - kill_zone_low) / 2,
+                           kill_zone_high + (kill_zone_high - kill_zone_low) / 2, lotaje)
+        print("El precio de cierre está por debajo del mínimo de la Kill Zone.")
+        print(f"Precio de cierre: {current_price}")
+
+    time.sleep(300)
